@@ -331,8 +331,9 @@ const MSG = {
     ],
 
     regAskQr: [
-        `Got it ✅ Now please send your MessQ R image to complete registration.`,
-        `Details saved! Now send your Mess QR code image.`
+        `Got it ✅ Now please send your payment QR image to complete registration.`,
+        `Details saved! Now send your payment QR code image.`,
+        `Almost done! Just send your QR image for payments.`
     ],
     regNeedImage: [
         `That doesn't look like an image. Please send your payment QR code as a photo.`,
@@ -673,19 +674,8 @@ if (chromePath) {
 }
 
 const client = new Client({
-    puppeteer: {
-        executablePath: '/usr/bin/chromium-browser',
-        args: [
-            '--no-sandbox',
-            '--disable-setuid-sandbox',
-            '--disable-dev-shm-usage',
-            '--disable-accelerated-2d-canvas',
-            '--no-first-run',
-            '--no-zygote',
-            '--disable-gpu'
-        ],
-        headless: true
-    }
+    authStrategy: new LocalAuth(),
+    puppeteer: puppeteerConfig
 });
 
 client.on('qr', qr => qrcode.generate(qr, { small: true }));
@@ -936,7 +926,7 @@ client.on('message', async (message) => {
 
 👤 *Register*
 register <name> <mobile> <upi>
-_Then send your Mess QR image._
+_Then send your payment QR image._
 Example: register Sagar 9876543210 sagar@upi
 
 🍽️ *Sell a Meal*
