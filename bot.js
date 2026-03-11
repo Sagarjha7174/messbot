@@ -1,3 +1,6 @@
+// Load .env if exists
+try { require('dotenv').config(); } catch {}
+
 const { Client, LocalAuth, MessageMedia } = require('whatsapp-web.js');
 const qrcode = require('qrcode-terminal');
 const mysql = require('mysql2/promise');
@@ -44,7 +47,38 @@ function findChromePath() {
     for (const p of (candidates[platform] || [])) {
         if (p && fs.existsSync(p)) return p;
     }
-    return null; // fallback to puppeteer bundled chromium
+    return null;
+}
+
+// ================= IST TIME HELPERS =================
+function getIST() {
+    const now = new Date();
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const utc = now.getTime() + (now.getTimezoneOffset() * 60000);
+    return new Date(utc + istOffset);
+}
+
+function getISTHour() {
+    return getIST().getHours();
+}
+
+function getISTDay() {
+    return getIST().getDay(); // 0=Sunday, 1=Monday, ...
+}
+
+function formatISTDate(timestamp) {
+    const d = new Date(timestamp);
+    const istOffset = 5.5 * 60 * 60 * 1000;
+    const utc = d.getTime() + (d.getTimezoneOffset() * 60000);
+    const ist = new Date(utc + istOffset);
+    const day = ist.getDate().toString().padStart(2, '0');
+    const months = ['Jan','Feb','Mar','Apr','May','Jun','Jul','Aug','Sep','Oct','Nov','Dec'];
+    const month = months[ist.getMonth()];
+    let hours = ist.getHours();
+    const mins = ist.getMinutes().toString().padStart(2, '0');
+    const ampm = hours >= 12 ? 'PM' : 'AM';
+    hours = hours % 12 || 12;
+    return `${day} ${month}, ${hours}:${mins} ${ampm}`;
 }
 
 // ================= MEAL TIME CONFIG =================
@@ -57,24 +91,66 @@ const MEAL_DEADLINES = {
 
 const MAX_LISTINGS_PER_SELLER = 5;
 
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+
 function getMealByTime() {
-    const hour = new Date().getHours();
+    const hour = getISTHour();
     if (hour >= 22 || hour < 10) return 'Breakfast';
     if (hour >= 10 && hour < 15) return 'Lunch';
     if (hour >= 15 && hour < 18) return 'Snacks';
     return 'Dinner';
 }
 
+/**
+ * Get the DAY the meal will actually be served on.
+ * If it's Monday 10PM and the meal is Breakfast → that's Tuesday's breakfast.
+ * If it's Monday 2PM and the meal is Dinner → that's Monday's dinner (same day).
+ * If it's Monday 10PM and the meal is Dinner → dinner time passed, this is for Tuesday.
+ */
+function getMealServingDay(meal) {
+    const hour = getISTHour();
+    const today = getISTDay();
+
+    if (meal === 'Breakfast') {
+        if (hour >= 22) return (today + 1) % 7;
+        if (hour < 10) return today;
+        return (today + 1) % 7;
+    }
+
+    const deadline = MEAL_DEADLINES[meal];
+    if (hour >= deadline) {
+        return (today + 1) % 7;
+    }
+    return today;
+}
+
+/**
+ * Does Kadamba require Veg/NonVeg selection for this meal on its serving day?
+ * 
+ * Rules:
+ * - Breakfast: EVERY day → Veg/NV required
+ * - Lunch: Sunday(0), Wednesday(3) → Veg/NV required
+ * - Dinner: Monday(1), Thursday(4), Friday(5) → Veg/NV required
+ * - Snacks: Never → no Veg/NV needed
+ * - All other combos: single menu, no selection needed
+ */
+function kadambaRequiresVegNV(meal, servingDay) {
+    if (meal === 'Breakfast') return true;
+    if (meal === 'Lunch' && [0, 3].includes(servingDay)) return true;
+    if (meal === 'Dinner' && [1, 4, 5].includes(servingDay)) return true;
+    return false;
+}
+
 function isMealExpiredNow(meal) {
     const deadline = MEAL_DEADLINES[meal];
     if (deadline === undefined) return false;
-    const hour = new Date().getHours();
+    const hour = getISTHour();
     if (meal === 'Breakfast') return hour >= 10 && hour < 22;
     return hour >= deadline;
 }
 
 function getExpiredMealsNow() {
-    const hour = new Date().getHours();
+    const hour = getISTHour();
     const expired = [];
     for (const [meal, deadline] of Object.entries(MEAL_DEADLINES)) {
         if (meal === 'Breakfast') {
@@ -309,14 +385,22 @@ function parseMessAndMeal(input) {
     }
 
     const messVal = MESS_ALIASES[matchedMessKey];
-    if (messVal === null) return { ambiguous: 'kadamba', remaining };
 
+    // Parse meal first (needed for day-based Kadamba logic)
     let meal = normalizeMeal(remaining);
     let mealWasGuessed = false;
+    if (!meal) { meal = getMealByTime(); mealWasGuessed = true; }
 
-    if (!meal) {
-        meal = getMealByTime();
-        mealWasGuessed = true;
+    // Handle Kadamba ambiguity (null = user typed "kadamba" or "kd" without veg/nv)
+    if (messVal === null) {
+        const servingDay = getMealServingDay(meal);
+        const needsVegNV = kadambaRequiresVegNV(meal, servingDay);
+
+        if (needsVegNV) {
+            return { ambiguous: 'kadamba', remaining, meal, mealWasGuessed, servingDay };
+        } else {
+            return { mess: 'Kadamba', meal, mealWasGuessed };
+        }
     }
 
     return { mess: messVal, meal, mealWasGuessed };
@@ -379,64 +463,46 @@ const MSG = {
     buyHasReservation: `You already have a pending reservation.\nSend *paid* to complete it, or *cancel* to drop it first.`,
     buyHasNegotiation: `You're already in a negotiation.\nSend an offer, *ok*, or *cancel* first.`,
 
-    kadambaAsk: (remaining) => {
+    kadambaAsk: (remaining, meal, servingDay) => {
+        const day = DAY_NAMES[servingDay] || '';
         const mealPart = remaining ? ` ${remaining}` : '';
-        return `Kadamba has both *Veg* and *Non-Veg*.\n\nPlease specify:\n• *Kadamba Veg${mealPart}*\n• *Kadamba NV${mealPart}*`;
+        return `Kadamba has both *Veg* and *Non-Veg* for *${meal}* on *${day}*.\n\nPlease specify:\n• *Kadamba Veg${mealPart}*\n• *Kadamba NV${mealPart}*`;
     },
 
-    lowball: [
-        `That's way too low 😅 Please send a reasonable offer.`,
-        `Come on, that's not serious. Try a proper offer.`,
-        `That won't work. Send a fair price and we can talk.`,
-        `Too low! Be realistic and send a better offer.`
-    ],
-    belowMin: [
-        `That's still too low. Please increase your offer.`,
-        `Can't go that low. Try coming up a bit.`,
-        `Not possible at that price. Offer something higher.`
-    ],
-    holdFirm: (price) => pick([
-        `₹${price} is already a fair price. Can you come closer?`,
-        `I'm firm at ₹${price}. Increase your offer a bit.`,
-        `₹${price} is the best I can do right now. Your move.`
+    // ---- Negotiation messages (all include reply instructions) ----
+    lowball: (counter) => pick([
+        `That's way too low 😅\nI can do *₹${counter}*. Reply *ok* to accept or send a better offer.`,
+        `Come on, not serious 😅\nBest I can offer: *₹${counter}*. Reply *ok* or send higher.`,
+        `Too low!\n*₹${counter}* is fair — reply *ok* to accept or counter.`
     ]),
-    smallDrop: (price) => pick([
-        `Alright, ₹${price} — that's the best I can do.`,
-        `Okay, I can stretch to ₹${price}. Deal?`,
-        `Max I can do is ₹${price}. Let me know.`
+    belowMin: (counter) => pick([
+        `Can't go that low.\nHow about *₹${counter}*? Reply *ok* to accept or increase your offer.`,
+        `Not possible at that price.\n*₹${counter}* works — reply *ok* or offer more.`
     ]),
-    decentDrop: (price) => pick([
-        `Okay, ₹${price} works. What do you say? 🤝`,
-        `I appreciate you coming up. ₹${price} — deal?`,
-        `Fair enough, let's do ₹${price}.`
+    counterOffer: (counter) => pick([
+        `How about *₹${counter}*? 🤝\nReply *ok* to accept or send your counter.`,
+        `I can do *₹${counter}*.\nReply *ok* to confirm or send a new offer.`,
+        `Let's meet at *₹${counter}*.\nReply *ok* to accept or counter.`
     ]),
-    bigDrop: (price) => pick([
-        `You seem serious! ₹${price} — let's close this 🤝`,
-        `Alright ₹${price}, can't go lower than this.`,
-        `That's a big move from you. ₹${price} final.`
+    firmOffer: (counter) => pick([
+        `*₹${counter}* is the best I can do. Final.\nReply *ok* to accept or *cancel* to walk away.`,
+        `Can't go below *₹${counter}*.\nReply *ok* to buy or *cancel* to pass.`,
+        `Final price: *₹${counter}*.\nReply *ok* or *cancel*.`
     ]),
-    sameOffer: (price) => pick([
-        `You already offered that. At least come up a little. ₹${price} stands.`,
-        `Same offer won't change the price 😅 ₹${price} is my number.`,
-        `Try increasing a bit. I'm holding at ₹${price}.`
+    repeatedOffer: (counter) => pick([
+        `I see you really want that price. Let me meet you halfway — *₹${counter}*.\nReply *ok* to accept or *cancel*.`,
+        `Alright, I hear you. Best I can stretch to: *₹${counter}*.\nReply *ok* or *cancel*.`,
+        `You've been firm, I respect that. *₹${counter}* — final.\nReply *ok* or *cancel*.`
     ]),
-    finalOffer: (price) => pick([
-        `₹${price} is the absolute lowest. Reply *ok* to buy or *cancel*.`,
-        `Can't go below ₹${price}. It's a *yes* or *no* now.`,
-        `Final price: ₹${price}. Reply *ok* or *cancel*.`
+    instantAccept: (price) => pick([
+        `That's a fair offer! ✅ Deal at *₹${price}*!\nReply *paid* after making payment.`,
+        `Done! *₹${price}* works 🤝\nReply *paid* after payment.`,
+        `Accepted! *₹${price}* 🎉\nReply *paid* once you've paid.`
     ]),
-    maxRounds: (price) => pick([
-        `We've been at it for a while. ₹${price} is final.\nReply *ok* to buy or *cancel* to walk away.`,
-        `That's my last offer — ₹${price}.\n*ok* to confirm, *cancel* to pass.`
-    ]),
-    pressure: [
-        `\n\n⏳ Others are checking this meal too, just so you know.`,
-        `\n\n⏳ FYI, this meal might get picked up soon.`,
-        ``
-    ],
+    pressure: `\n\n⏳ Others are checking this meal too.`,
+
     dealDone: (price) => pick([
-        `Done at ₹${price}! 🤝\nReply *paid* after making the payment.`,
-        `Deal locked at ₹${price} ✅\nSend *paid* once you've paid.`,
+        `Deal locked at ₹${price} ✅\nReply *paid* after making payment.`,
         `₹${price} it is! 🎉\nReply *paid* after payment.`
     ]),
     reserved: (price) => pick([
@@ -554,7 +620,6 @@ setInterval(async () => {
     try {
         const cutoff = Date.now() - 5 * 60 * 1000;
 
-        // Find who to notify BEFORE releasing
         const [stale] = await pool.query(
             `SELECT id, reservedBy FROM listings
              WHERE status='reserved' AND reservedAt < ?`,
@@ -568,7 +633,6 @@ setInterval(async () => {
                 [cutoff]
             );
 
-            // Notify buyers & clean up their in-memory state
             for (const row of stale) {
                 if (row.reservedBy) {
                     delete activeReservations[row.reservedBy];
@@ -579,7 +643,7 @@ setInterval(async () => {
             console.log(`🧹 Released ${stale.length} stale reservation(s)`);
         }
 
-        // Also clean up stuck 'processing' status (crash recovery)
+        // Clean up stuck 'processing' status (crash recovery)
         await pool.query(
             `UPDATE listings SET status='reserved'
              WHERE status='processing' AND reservedAt < ?`,
@@ -606,7 +670,6 @@ setInterval(async () => {
         const expiredMeals = getExpiredMealsNow();
         if (expiredMeals.length === 0) return;
 
-        // Find active negotiations on soon-to-be-deleted listings
         const [expiring] = await pool.query(
             `SELECT id, reservedBy FROM listings
              WHERE status IN ('available', 'reserved') AND meal IN (?)`,
@@ -617,18 +680,15 @@ setInterval(async () => {
 
         const expiringIds = expiring.map(r => r.id);
 
-        // Clean up in-memory negotiation states tied to these listings
         for (const [sender, state] of Object.entries(activeNegotiations)) {
             if (expiringIds.includes(state.listingId)) {
                 clearNegotiationTimers(sender);
                 delete activeNegotiations[sender];
-                const listing = expiring.find(r => r.id === state.listingId);
-                const meal = expiredMeals[0]; // approximate
+                const meal = expiredMeals[0];
                 await safeNotify(sender, MSG.mealExpiredBuyer(meal));
             }
         }
 
-        // Notify reserved buyers
         for (const row of expiring) {
             if (row.reservedBy && activeReservations[row.reservedBy]) {
                 delete activeReservations[row.reservedBy];
@@ -637,7 +697,6 @@ setInterval(async () => {
             }
         }
 
-        // Delete all expired listings (available + reserved)
         const [result] = await pool.query(
             `DELETE FROM listings WHERE status IN ('available', 'reserved') AND meal IN (?)`,
             [expiredMeals]
@@ -651,31 +710,30 @@ setInterval(async () => {
 }, 5 * 60 * 1000);
 
 // ================= WHATSAPP CLIENT =================
-const chromePath = findChromePath();
+const detectedChrome = findChromePath();
 
-const puppeteerConfig = {
-    headless: true,
-    args: [
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
-        '--disable-gpu',
-        '--disable-dev-shm-usage',
-        '--no-first-run',
-        '--no-zygote',
-        '--single-process'
-    ]
-};
-
-if (chromePath) {
-    puppeteerConfig.executablePath = chromePath;
-    console.log(`🌐 Chrome: ${chromePath}`);
-} else {
-    console.log('🌐 Using Puppeteer bundled Chromium');
+if (!detectedChrome) {
+    console.error('❌ Chrome not found! Install: sudo apt install google-chrome-stable');
+    process.exit(1);
 }
+
+console.log(`🌐 Chrome: ${detectedChrome}`);
 
 const client = new Client({
     authStrategy: new LocalAuth(),
-    puppeteer: puppeteerConfig
+    puppeteer: {
+        executablePath: detectedChrome,
+        headless: true,
+        args: [
+            '--no-sandbox',
+            '--disable-setuid-sandbox',
+            '--disable-gpu',
+            '--disable-dev-shm-usage',
+            '--disable-accelerated-2d-canvas',
+            '--no-first-run',
+            '--disable-extensions'
+        ]
+    }
 });
 
 client.on('qr', qr => qrcode.generate(qr, { small: true }));
@@ -683,75 +741,112 @@ client.on('ready', () => console.log('✅ MessBot is live!'));
 client.on('auth_failure', msg => console.error('❌ Auth failed:', msg));
 client.on('disconnected', reason => {
     console.log('⚠️ Disconnected:', reason);
-    setTimeout(() => {
-        try { client.initialize(); } catch (err) {
-            console.error('Reconnect failed:', err.message);
-        }
-    }, 5000);
+    process.exit(1);
 });
 
-// ================= NEGOTIATION ENGINE =================
+// ================= NEGOTIATION ENGINE v2 =================
+/**
+ * Smart negotiation:
+ * 1. ALWAYS propose a concrete counter price
+ * 2. ALWAYS include "reply ok to accept" in every response
+ * 3. offer >= 75% of asking → instant accept
+ * 4. offer >= midpoint(min,asking) → accept or tiny counter
+ * 5. Repeated same offer 3x → bot meets halfway, says "final"
+ * 6. Every counter = smart midpoint between positions
+ * 7. After round 5 → firm final offer
+ */
 function negotiate(state, offer, listing) {
     const { startPrice, minPrice } = listing;
     const { currentCounter, lastBuyerOffer, round } = state;
+    const range = startPrice - minPrice;
+    const midpoint = roundTo5((startPrice + minPrice) / 2);
 
-    if (offer <= 0) return { action: 'lowball' };
+    // Reject zero/negative
+    if (offer <= 0) {
+        const counter = roundTo5(startPrice - range * 0.15);
+        return { action: 'lowball', counter: Math.max(counter, minPrice) };
+    }
 
-    if (offer >= currentCounter)     return { action: 'accept', price: roundTo5(offer) };
-    if (offer >= currentCounter - 5) return { action: 'accept', price: roundTo5(offer) };
+    // INSTANT ACCEPT: offer >= 75% of asking
+    if (offer >= startPrice * 0.75) {
+        return { action: 'instantAccept', price: roundTo5(offer) };
+    }
 
+    // INSTANT ACCEPT: offer >= current counter or within 5
+    if (offer >= currentCounter - 5) {
+        return { action: 'instantAccept', price: roundTo5(offer) };
+    }
+
+    // VERY LOW: below minPrice
     if (offer < minPrice) {
-        if (offer < startPrice * 0.5) return { action: 'lowball' };
-        return { action: 'belowMin' };
+        if (offer < startPrice * 0.4) {
+            // Absurdly low — counter at ~70% of asking
+            const counter = roundTo5(startPrice * 0.7);
+            return { action: 'lowball', counter: Math.max(counter, minPrice) };
+        }
+        // Below min but not absurd — counter at midpoint
+        const counter = roundTo5((currentCounter + offer) / 2);
+        return { action: 'belowMin', counter: Math.max(counter, minPrice) };
     }
 
-    if (round >= 5) return { action: 'maxRounds', price: currentCounter };
+    // REPEATED SAME OFFER 3+ times → meet halfway
+    if (lastBuyerOffer !== null && offer === lastBuyerOffer) {
+        const newSameCount = (state.sameOfferCount || 0) + 1;
+        state.sameOfferCount = newSameCount;
 
-    // Only count jumps from valid offers (not lowballs/below-min)
-    const buyerJump = (lastBuyerOffer !== null && lastBuyerOffer >= minPrice)
-        ? (offer - lastBuyerOffer)
-        : 0;
-
-    if (lastBuyerOffer !== null && lastBuyerOffer >= minPrice && buyerJump <= 0) {
-        return { action: 'sameOffer', price: currentCounter };
-    }
-
-    // Round 0: Hold firm or tiny drop
-    if (round === 0) {
-        const ratio = offer / startPrice;
-        if (ratio < 0.70) return { action: 'holdFirm', price: currentCounter };
-
-        let newCounter = roundTo5(currentCounter - 5);
-        newCounter = Math.max(newCounter, minPrice);
-        return { action: 'smallDrop', price: newCounter };
-    }
-
-    // Round 1+: Mirror buyer's movement
-    let drop;
-    if (buyerJump <= 5) {
-        drop = 5;
-    } else if (buyerJump <= 15) {
-        drop = 10;
+        if (newSameCount >= 3) {
+            let compromise = roundTo5((currentCounter + offer) / 2);
+            compromise = Math.max(compromise, minPrice);
+            // If compromise is close to offer, just accept
+            if (compromise <= offer + 5) {
+                return { action: 'instantAccept', price: roundTo5(offer) };
+            }
+            return { action: 'repeated', counter: compromise };
+        }
     } else {
-        const midpoint = roundTo5((currentCounter + offer) / 2);
-        drop = currentCounter - midpoint;
-        drop = Math.min(drop, 15);
+        state.sameOfferCount = 0;
     }
 
-    let newCounter = roundTo5(currentCounter - drop);
-    newCounter = Math.max(newCounter, minPrice);
-
-    // Snap to minPrice if close
-    if (newCounter - minPrice <= 10 && newCounter !== minPrice) {
-        newCounter = minPrice;
+    // GOOD OFFER: at or above midpoint → accept or tiny counter
+    if (offer >= midpoint) {
+        let counter = roundTo5(offer + (currentCounter - offer) * 0.3);
+        counter = Math.max(counter, minPrice);
+        // If counter is barely above offer, just accept
+        if (counter <= offer + 5) {
+            return { action: 'instantAccept', price: roundTo5(offer) };
+        }
+        return { action: 'counter', counter, addPressure: round >= 3 };
     }
 
-    if (offer >= newCounter - 5) return { action: 'accept', price: roundTo5(offer) };
-    if (newCounter === minPrice)  return { action: 'finalOffer', price: newCounter };
+    // DECENT OFFER: between min and midpoint → smart counter
+    const buyerGap = offer - minPrice;
+    const totalGap = startPrice - minPrice;
+    const buyerProgress = totalGap > 0 ? buyerGap / totalGap : 0;
 
-    if (drop <= 5)  return { action: 'smallDrop', price: newCounter };
-    if (drop <= 10) return { action: 'decentDrop', price: newCounter };
-    return { action: 'bigDrop', price: newCounter };
+    let counter;
+    if (buyerProgress < 0.2) {
+        // Buyer barely above min — counter at ~65% of range
+        counter = roundTo5(minPrice + totalGap * 0.65);
+    } else if (buyerProgress < 0.4) {
+        // Counter at ~55% of range
+        counter = roundTo5(minPrice + totalGap * 0.55);
+    } else {
+        // Counter at midpoint between positions
+        counter = roundTo5((currentCounter + offer) / 2);
+    }
+
+    counter = Math.max(counter, minPrice);
+    // Don't counter ABOVE current counter (always go down)
+    counter = Math.min(counter, currentCounter);
+
+    // Round 5+ → firm final
+    if (round >= 5) {
+        let finalPrice = roundTo5((currentCounter + offer) / 2);
+        finalPrice = Math.max(finalPrice, minPrice);
+        return { action: 'firm', counter: finalPrice };
+    }
+
+    return { action: 'counter', counter, addPressure: round >= 3 };
 }
 
 // ================= MESSAGE HANDLER =================
@@ -844,67 +939,48 @@ client.on('message', async (message) => {
                     }
                     activeReservations[sender] = { listingId: listing.id, reservedAt: Date.now() };
                     delete activeNegotiations[sender];
-                    return message.reply(MSG.dealDone(price));
+                    return message.reply(MSG.instantAccept(price));
                 };
 
                 switch (result.action) {
-                    case 'accept':   return doAccept(result.price);
+                    case 'instantAccept':
+                        return doAccept(result.price);
 
                     case 'lowball': {
+                        state.currentCounter = result.counter;
                         state.lastBuyerOffer = roundedOffer;
+                        state.round++;
                         startSilenceTimer(sender, listing.id);
-                        return message.reply(pick(MSG.lowball));
+                        return message.reply(MSG.lowball(result.counter));
                     }
                     case 'belowMin': {
-                        state.lastBuyerOffer = roundedOffer;
-                        startSilenceTimer(sender, listing.id);
-                        return message.reply(pick(MSG.belowMin));
-                    }
-                    case 'holdFirm': {
+                        state.currentCounter = result.counter;
                         state.lastBuyerOffer = roundedOffer;
                         state.round++;
                         startSilenceTimer(sender, listing.id);
-                        return message.reply(MSG.holdFirm(result.price));
+                        return message.reply(MSG.belowMin(result.counter));
                     }
-                    case 'sameOffer': {
+                    case 'repeated': {
+                        state.currentCounter = result.counter;
+                        state.round++;
                         startSilenceTimer(sender, listing.id);
-                        return message.reply(MSG.sameOffer(result.price));
+                        return message.reply(MSG.repeatedOffer(result.counter));
                     }
-                    case 'maxRounds': {
-                        startSilenceTimer(sender, listing.id);
-                        return message.reply(MSG.maxRounds(result.price));
-                    }
-                    case 'finalOffer': {
-                        state.currentCounter = result.price;
+                    case 'firm': {
+                        state.currentCounter = result.counter;
                         state.lastBuyerOffer = roundedOffer;
                         state.round++;
                         startSilenceTimer(sender, listing.id);
-                        return message.reply(MSG.finalOffer(result.price));
+                        return message.reply(MSG.firmOffer(result.counter));
                     }
-                    case 'smallDrop': {
-                        let msg = MSG.smallDrop(result.price);
-                        if (state.round >= 2) msg += pick(MSG.pressure);
-                        state.currentCounter = result.price;
+                    case 'counter': {
+                        let msg = MSG.counterOffer(result.counter);
+                        if (result.addPressure) msg += MSG.pressure;
+                        state.currentCounter = result.counter;
                         state.lastBuyerOffer = roundedOffer;
                         state.round++;
                         startSilenceTimer(sender, listing.id);
                         return message.reply(msg);
-                    }
-                    case 'decentDrop': {
-                        let msg = MSG.decentDrop(result.price);
-                        if (state.round >= 3) msg += pick(MSG.pressure);
-                        state.currentCounter = result.price;
-                        state.lastBuyerOffer = roundedOffer;
-                        state.round++;
-                        startSilenceTimer(sender, listing.id);
-                        return message.reply(msg);
-                    }
-                    case 'bigDrop': {
-                        state.currentCounter = result.price;
-                        state.lastBuyerOffer = roundedOffer;
-                        state.round++;
-                        startSilenceTimer(sender, listing.id);
-                        return message.reply(MSG.bigDrop(result.price));
                     }
                 }
             }
@@ -957,7 +1033,8 @@ delist
 
 🏢 *Messes:* Palash, Yuktahar, Kadamba Veg, Kadamba NV
 🍽️ *Meals:* Breakfast (BF), Lunch, Snacks, Dinner
-⏰ *Auto-expiry:* BF→10AM, Lunch→3PM, Snacks→6PM, Dinner→10PM`
+⏰ *Auto-expiry:* BF→10AM, Lunch→3PM, Snacks→6PM, Dinner→10PM
+🕐 All times in IST`
             );
         }
 
@@ -1013,7 +1090,7 @@ delist
             const parsed = parseMessAndMeal(messAndMeal);
 
             if (parsed.error) return message.reply(parsed.error);
-            if (parsed.ambiguous) return message.reply(MSG.kadambaAsk(parsed.remaining || ''));
+            if (parsed.ambiguous) return message.reply(MSG.kadambaAsk(parsed.remaining || '', parsed.meal, parsed.servingDay));
 
             const { mess, meal, mealWasGuessed } = parsed;
 
@@ -1067,14 +1144,12 @@ delist
 
         // --- Delist ---
         if (lower === 'delist') {
-            // Also clean up any negotiations tied to these listings
             const [myListings] = await pool.query(
                 `SELECT id FROM listings WHERE seller=? AND status='available'`,
                 [sender]
             );
             const myIds = myListings.map(r => r.id);
 
-            // Cancel any buyer negotiations on these listings
             for (const [buyerSender, state] of Object.entries(activeNegotiations)) {
                 if (myIds.includes(state.listingId)) {
                     clearNegotiationTimers(buyerSender);
@@ -1108,7 +1183,7 @@ delist
 
             const parsed = parseMessAndMeal(rawInput);
             if (parsed.error) return message.reply(parsed.error);
-            if (parsed.ambiguous) return message.reply(MSG.kadambaAsk(parsed.remaining || ''));
+            if (parsed.ambiguous) return message.reply(MSG.kadambaAsk(parsed.remaining || '', parsed.meal, parsed.servingDay));
 
             const { mess, meal, mealWasGuessed } = parsed;
 
@@ -1133,7 +1208,8 @@ delist
                 listingId: listing.id,
                 currentCounter: listing.startPrice,
                 lastBuyerOffer: null,
-                round: 0
+                round: 0,
+                sameOfferCount: 0
             };
 
             let reply = MSG.buyStart(mess, meal, listing.startPrice);
@@ -1224,9 +1300,8 @@ delist
             return message.reply(MSG.paymentDone(orderId));
         }
 
-        // --- Orders ---
+        // --- Orders (IST time) ---
         if (lower === 'orders') {
-            // FIX #9: UNION instead of OR for index usage
             const [orders] = await pool.query(
                 `(SELECT * FROM orders WHERE buyer=? ORDER BY createdAt DESC LIMIT 20)
                  UNION ALL
@@ -1240,9 +1315,7 @@ delist
             let msg = `📦 *Your Orders (last 24h):*\n`;
 
             for (const o of orders) {
-                const date = new Date(o.createdAt).toLocaleString('en-IN', {
-                    day: '2-digit', month: 'short', hour: '2-digit', minute: '2-digit'
-                });
+                const date = formatISTDate(o.createdAt);
 
                 const mealInfo = (o.mess && o.meal) ? `${o.mess} — ${o.meal}` : 'Meal';
 
@@ -1261,7 +1334,6 @@ delist
             if (activeReservations[sender]) {
                 const { listingId } = activeReservations[sender];
 
-                // Get seller info before releasing
                 const [lr] = await pool.query('SELECT seller, mess, meal, finalPrice FROM listings WHERE id=?', [listingId]);
 
                 await pool.query(
@@ -1272,7 +1344,6 @@ delist
 
                 delete activeReservations[sender];
 
-                // Notify seller that buyer backed out
                 if (lr.length && lr[0].seller) {
                     await safeNotify(lr[0].seller,
                         `ℹ️ A buyer cancelled their reservation for *${lr[0].mess} — ${lr[0].meal}* at ₹${lr[0].finalPrice}.\nYour listing is back on the market.`
