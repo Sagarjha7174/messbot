@@ -331,9 +331,9 @@ const MSG = {
     ],
 
     regAskQr: [
-        `Got it ✅ Now please send your payment QR image to complete registration.`,
-        `Details saved! Now send your payment QR code image.`,
-        `Almost done! Just send your QR image for payments.`
+        `Got it ✅ Now please send your mess QR image to complete registration.`,
+        `Details saved! Now send your mess QR code image.`,
+        `Almost done! Just send your mess QR.`
     ],
     regNeedImage: [
         `That doesn't look like an image. Please send your payment QR code as a photo.`,
@@ -926,8 +926,8 @@ client.on('message', async (message) => {
 
 👤 *Register*
 register <name> <mobile> <upi>
-_Then send your payment QR image._
-Example: register Sagar 9876543210 sagar@upi
+_Then send your Mess QR image._
+Example: register abc 9876543210 xyz@upi
 
 🍽️ *Sell a Meal*
 sell <mess> <meal> <askingPrice> <minPrice>
