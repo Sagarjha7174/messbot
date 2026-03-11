@@ -102,7 +102,7 @@ Session is saved locally after first scan.
 **PM2 (recommended):**
 ```bash
 npm install -g pm2
-pm2 start index.js --name messbot
+pm2 start bot.js --name messbot
 pm2 save
 pm2 startup
 ```
